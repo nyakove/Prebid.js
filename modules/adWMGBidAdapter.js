@@ -2,9 +2,16 @@
 
 import { registerBidder } from '../src/adapters/bidderFactory.js';
 import { config } from '../src/config.js';
-import { BANNER } from '../src/mediaTypes.js';
+import { BANNER, VIDEO } from '../src/mediaTypes.js';
+import { deepAccess, isArray } from '../src/utils.js';
 import { parseUserAgentDetailed } from '../libraries/userAgentUtils/detailed.js';
 import { tryAppendQueryString } from '../libraries/urlUtils/urlUtils.js';
+
+/**
+ * @typedef {import('../src/adapters/bidderFactory.js').BidRequest} BidRequest
+ * @typedef {import('../src/adapters/bidderFactory.js').Bid} Bid
+ * @typedef {import('../src/adapters/bidderFactory.js').ServerResponse} ServerResponse
+ */
 
 const BIDDER_CODE = 'adWMG';
 const ENDPOINT = 'https://hb.adwmg.com/hb';
@@ -13,22 +20,27 @@ let SYNC_ENDPOINT = 'https://hb.adwmg.com/cphb.html?';
 export const spec = {
   code: BIDDER_CODE,
   aliases: ['wmg'],
-  supportedMediaTypes: [BANNER],
+  supportedMediaTypes: [BANNER, VIDEO],
   isBidRequestValid: (bid) => {
-    if (!(bid.params.publisherId)) {
+    if (!bid.params.publisherId) {
       return false;
     }
 
-    return true;
+    const hasBanner = !!deepAccess(bid, 'mediaTypes.banner');
+    const videoParams = deepAccess(bid, 'mediaTypes.video');
+    const hasVideo = !!(videoParams &&
+      isArray(videoParams.playerSize) && videoParams.playerSize.length > 0 &&
+      isArray(videoParams.mimes) && videoParams.mimes.length > 0);
+
+    return hasBanner || hasVideo;
   },
   buildRequests: (validBidRequests, bidderRequest) => {
     const timeout = bidderRequest.timeout || 0;
     const debug = config.getConfig('debug') || false;
-    // TODO: is 'page' the right value here?
     const referrer = bidderRequest.refererInfo.page;
-    const locale = window.navigator.language && window.navigator.language.length > 0 ? window.navigator.language.substr(0, 2) : '';
+    const locale = navigator?.language ? navigator.language.substr(0, 2) : '';
     const domain = bidderRequest.refererInfo.domain || '';
-    const ua = window.navigator.userAgent.toLowerCase();
+    const ua = navigator?.userAgent ? navigator.userAgent.toLowerCase() : '';
     const additional = spec.parseUserAgent(ua);
 
     return validBidRequests.map(bidRequest => {
@@ -36,6 +48,23 @@ export const spec = {
         if (isNaN(parseFloat(value))) {
           return 0;
         } else return parseFloat(value);
+      };
+
+      // Resolve floor: prefer getFloor() module, fall back to params.floorCPM
+      let floorCPM = 0;
+      if (bidRequest.params.floorCPM) {
+        floorCPM = checkFloorValue(bidRequest.params.floorCPM);
+      }
+      if (typeof bidRequest.getFloor === 'function') {
+        const mediaType = deepAccess(bidRequest, 'mediaTypes.video') ? VIDEO : BANNER;
+        const floorInfo = bidRequest.getFloor({
+          currency: 'USD',
+          mediaType,
+          size: '*'
+        });
+        if (floorInfo && floorInfo.floor && !isNaN(floorInfo.floor)) {
+          floorCPM = floorInfo.floor;
+        }
       }
 
       const adUnit = {
@@ -45,7 +74,7 @@ export const spec = {
           params: {
             publisherId: bidRequest.params.publisherId,
             IABCategories: bidRequest.params.IABCategories || [],
-            floorCPM: bidRequest.params.floorCPM ? checkFloorValue(bidRequest.params.floorCPM) : 0
+            floorCPM
           }
         },
         mediaTypes: bidRequest.mediaTypes
@@ -55,8 +84,14 @@ export const spec = {
         adUnit.sizes = bidRequest.sizes;
       }
 
+      // schain: prefer ortb2.source.ext.schain per Prebid.js conventions, fall back to legacy bidRequest.schain
+      const supplyChain =
+        deepAccess(bidRequest, 'ortb2.source.ext.schain') ||
+        deepAccess(bidderRequest, 'ortb2.source.ext.schain') ||
+        bidRequest.schain ||
+        {};
+
       const request = {
-        // TODO: fix auctionId leak: https://github.com/prebid/Prebid.js/issues/9781
         auctionId: bidRequest.auctionId,
         requestId: bidRequest.bidId,
         bidRequestsCount: bidRequest.bidRequestsCount,
@@ -69,7 +104,8 @@ export const spec = {
         domain: domain,
         os: additional.os,
         osv: additional.osv,
-        devicetype: additional.devicetype
+        devicetype: additional.devicetype,
+        supplyChain: supplyChain
       };
 
       if (bidderRequest.gdprConsent) {
@@ -79,10 +115,6 @@ export const spec = {
         };
       }
 
-      /*       if (bidderRequest.uspConsent) {
-        request.uspConsent = bidderRequest.uspConsent;
-      }
- */
       if (bidRequest.userId && bidRequest.userId.pubcid) {
         request.userId = {
           pubcid: bidRequest.userId.pubcid
@@ -96,15 +128,19 @@ export const spec = {
       return {
         method: 'POST',
         url: ENDPOINT,
-        data: JSON.stringify(request)
-      }
+        data: JSON.stringify(request),
+        bidRequest
+      };
     });
   },
-  interpretResponse: (serverResponse) => {
+  interpretResponse: (serverResponse, httpRequest) => {
     const bidResponses = [];
 
     if (serverResponse.body) {
       const response = serverResponse.body;
+      const isVideo = !!(response.vastXml || response.vastUrl);
+      const mediaType = isVideo ? VIDEO : BANNER;
+
       const bidResponse = {
         requestId: response.requestId,
         cpm: response.cpm,
@@ -114,18 +150,39 @@ export const spec = {
         currency: response.currency,
         netRevenue: response.netRevenue,
         ttl: response.ttl,
-        ad: response.ad,
         meta: {
           advertiserDomains: response.adomain && response.adomain.length ? response.adomain : [],
-          mediaType: 'banner'
+          mediaType
         }
       };
+
+      if (isVideo) {
+        bidResponse.mediaType = VIDEO;
+        if (response.vastXml) {
+          bidResponse.vastXml = response.vastXml;
+        }
+        if (response.vastUrl) {
+          bidResponse.vastUrl = response.vastUrl;
+        }
+        // For instream video, width/height come from playerSize if not in response
+        if (httpRequest && httpRequest.bidRequest) {
+          const playerSize = deepAccess(httpRequest.bidRequest, 'mediaTypes.video.playerSize');
+          if (playerSize && playerSize[0]) {
+            bidResponse.width = response.width || playerSize[0][0];
+            bidResponse.height = response.height || playerSize[0][1];
+          }
+        }
+      } else {
+        bidResponse.mediaType = BANNER;
+        bidResponse.ad = response.ad;
+      }
+
       bidResponses.push(bidResponse);
     }
 
     return bidResponses;
   },
-  getUserSyncs: (syncOptions, serverResponses, gdprConsent, uspConsent) => {
+  getUserSyncs: (syncOptions, serverResponses, gdprConsent) => {
     if (gdprConsent && SYNC_ENDPOINT.indexOf('gdpr') === -1) {
       SYNC_ENDPOINT = tryAppendQueryString(SYNC_ENDPOINT, 'gdpr', (gdprConsent.gdprApplies ? 1 : 0));
     }
@@ -138,9 +195,6 @@ export const spec = {
       SYNC_ENDPOINT = SYNC_ENDPOINT.slice(0, -1);
     }
 
-    /*     if (uspConsent) {
-      SYNC_ENDPOINT = tryAppendQueryString(SYNC_ENDPOINT, 'us_privacy', uspConsent);
-    } */
     const syncs = [];
     if (syncOptions.iframeEnabled) {
       syncs.push({
